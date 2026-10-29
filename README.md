@@ -14,6 +14,11 @@ Data collected:
 
 Only InfluxDB 2 is supported. Support for InfluxDB 1 has been removed.
 
+> **Note:** This build (`+thomo`) contains unofficial changes by Thomas Mohaupt on top of the official 1.2.4 release:
+> * measurements older than the retention period of the InfluxDB bucket are dropped before they are written
+> * InfluxDB "partial write" errors caused by the retention period are no longer logged as errors and retried
+> * support for InfluxDB 1 has been removed
+
 ![Grafana Dashboard](https://raw.githubusercontent.com/bb-Ricardo/fritzinfluxdb/main/grafana/grafana_dashboard.png)
 
 
@@ -191,7 +196,7 @@ Otherwise InfluxDB drops these measurements itself and only an info message is l
 usage: fritzinfluxdb.py [-h] [-c fritzinfluxdb.ini [fritzinfluxdb.ini ...]] [-d] [-v]
 
 fritzinfluxdb
-Version: 1.2.4 (2024-10-15)
+Version: 1.2.4+thomo.1 (2026-10-29)
 Project URL: https://github.com/bb-Ricardo/fritzinfluxdb
 
 optional arguments:
