@@ -12,7 +12,7 @@ Data collected:
 * WLAN information (num clients, status, channels)
 * VPN/DynDNS information (active users, vpn hostname, DynDNS settings)
 
-Both InfluxDB 1 and InfluxDB 2 are supported
+Only InfluxDB 2 is supported. Support for InfluxDB 1 has been removed.
 
 ![Grafana Dashboard](https://raw.githubusercontent.com/bb-Ricardo/fritzinfluxdb/main/grafana/grafana_dashboard.png)
 
@@ -23,7 +23,6 @@ In order work properly you need to enable "permit access for applications" and "
 
 ## Requirements
 * python3.7 or newer
-* influxdb (InfluxDB 1)
 * influxdb_client (InfluxDB 2)
 * fritzconnection
 * pytz
@@ -170,16 +169,10 @@ docker run --link influxdb -d -v /PATH/TO/fritzinfluxdb.ini:/app/fritzinfluxdb.i
 
 ### InfluxDB Setup
 
-To create an InfluxDB 1 database or InfluxDB 2 Bucket (incl. retention policy mapping) it is recommended to use
+To create an InfluxDB 2 Bucket (incl. retention policy mapping) it is recommended to use
 admin credentials/token on the first run. **DON'T** use an admin token after initial setup has finished.
 
-InfluxDB 1 example:
-```shell
-export INFLUXDB_USERNAME=admin
-export INFLUXDB_PASSWORD=SuperSecret
-```
-
-InfluxDB 2 example:
+Example:
 ```shell
 export INFLUXDB_TOKEN=InfluxDBAdminToken
 ```
@@ -187,7 +180,11 @@ export INFLUXDB_TOKEN=InfluxDBAdminToken
 If running via docker [this](https://docs.docker.com/engine/reference/commandline/run/#set-environment-variables--e---env---env-file)
 link describes how to set env vars on a `docker run`
 
-For InfluxDB 2 it is highly recommended creating a specific write only token for the defined bucket.
+It is highly recommended creating a specific write only token for the defined bucket.
+
+If the token is also permitted to read buckets, the retention period of the bucket is read on startup and
+measurements which are older (e.g. old entries of the phone call list) are dropped before they are written.
+Otherwise InfluxDB drops these measurements itself and only an info message is logged.
 
 ## Running the script
 ```
@@ -208,27 +205,14 @@ optional arguments:
 ## Grafana
 
 Dashboards to display the collected data are included under [grafana](https://github.com/bb-Ricardo/fritzinfluxdb/blob/main/grafana).
-Due to some limitations of the InfluxDB 1.8 Flux language implementation the dashboards had to bes separated.
 
-Influx data source configuration:
-
-InfluxDB 1.8:
-  * the "Query Language" `InfluxQL` has to be selected
-  * DEPRECATED: these dashboards will not be developed/extended any further
-
-InfluxDB >=2.2.0:
+Influx data source configuration (InfluxDB >=2.2.0):
   * the "Query Language" `Flux` has to be selected
   * the bucket with the fritzbox data has to be set as default bucket (all dashboards use the default bucket)
 
 ### Dashboards
 There are following Dashboards included:
 
-InfluxDB 1.8.X (deprecated):
-* [fritzbox_system_dashboard.json](https://github.com/bb-Ricardo/fritzinfluxdb/blob/main/grafana/influx1_dashboards/fritzbox_system_dashboard.json)
-* [fritzbox_logs_dashboard.json](https://github.com/bb-Ricardo/fritzinfluxdb/blob/main/grafana/influx1_dashboards/fritzbox_logs_dashboard.json)
-* [fritzbox_call_log_dashboard.json](https://github.com/bb-Ricardo/fritzinfluxdb/blob/main/grafana/influx1_dashboards/fritzbox_call_log_dashboard.json)
-
-InfluxDB >=2.2.0:
 * [fritzbox_system_dashboard.json](https://github.com/bb-Ricardo/fritzinfluxdb/blob/main/grafana/influx2_dashboards/fritzbox_system_dashboard.json)
 * [fritzbox_logs_dashboard.json](https://github.com/bb-Ricardo/fritzinfluxdb/blob/main/grafana/influx2_dashboards/fritzbox_logs_dashboard.json)
 * [fritzbox_call_log_dashboard.json](https://github.com/bb-Ricardo/fritzinfluxdb/blob/main/grafana/influx2_dashboards/fritzbox_call_log_dashboard.json)

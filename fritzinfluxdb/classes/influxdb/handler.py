@@ -9,17 +9,11 @@
 
 import asyncio
 import pytz
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.client import HTTPConnection
 from logging import LogRecord
 
-import requests
-
-# InfluxDB version 1.x client
-from influxdb import InfluxDBClient as InfluxDBClientV1
-from influxdb.exceptions import InfluxDBClientError
-# InfluxDB version 2.x client
-from influxdb_client import InfluxDBClient as InfluxDBClientV2, BucketRetentionRules, DBRPCreate, DBRPsService
+from influxdb_client import InfluxDBClient, BucketRetentionRules, DBRPCreate, DBRPsService
 from influxdb_client.rest import ApiException
 from influxdb_client.client.write_api import SYNCHRONOUS
 from influxdb_client.domain.write_precision import WritePrecision
@@ -38,13 +32,11 @@ class InfluxHandler:
     name = "InfluxDB"
 
     config = None
-    session_v1 = None
-    session_v2 = None
-    session_v2_write_api = None
+    session = None
+    write_api = None
 
     # default InfluxDB connection timeout
-    connection_timeout_v1 = 2
-    connection_timeout_v2 = 5
+    connection_timeout = 5
 
     # max size of message buffer before discarding old measurements
     max_measurements_buffer_size = 1_000_000
@@ -62,178 +54,83 @@ class InfluxHandler:
     # max interval between write retries
     max_retry_interval = 120
 
+    # measurements closer than this to the retention period boundary are dropped as well,
+    # as the boundary keeps moving while measurements wait in the buffer
+    retention_period_margin = timedelta(minutes=5)
+
     # keep track if this instance was initiated successfully
     init_successful = False
 
     # set to true if connection to InfluxDB got lost
     connection_lost = False
 
-    # keep track if InfluxDB refuses to write data which is out of range
-    out_of_retention_period_range = False
-
     def __init__(self, config, user_agent=None):
 
         self.config = InfluxDBConfig(config)
-        self.version = str(self.config.version)
+        self.version = None
         self.init_successful = False
 
         self.buffer = list()
 
+        # retention period of the configured bucket, None if unknown or infinite
+        self.retention_period = None
+
         self.current_retry_interval = self.retry_interval
         self.last_write_retry = None
-        self.session_v1_requests_session = requests.Session()
         self.current_max_measurements_buffer_warning = self.max_measurements_buffer_warning
-        self.current_measurements_per_write = self.max_measurements_per_write
 
-        if self.config.version == 1:
+        proto = "http"
+        if self.config.tls_enabled:
+            proto = "https"
 
-            self.session_v1 = InfluxDBClientV1(
-                host=self.config.hostname,
-                port=self.config.port,
-                username=self.config.username,
-                password=self.config.password,
-                database=self.config.database,
-                ssl=self.config.tls_enabled,
-                verify_ssl=self.config.verify_tls,
-                timeout=self.connection_timeout_v1,
-                session=self.session_v1_requests_session
-            )
+        debug = False
+        if HTTPConnection.debuglevel > 0:
+            debug = True
 
-        else:
-
-            proto = "http"
-            if self.config.tls_enabled:
-                proto = "https"
-
-            debug = False
-            if HTTPConnection.debuglevel > 0:
-                debug = True
-
-            self.session_v2 = InfluxDBClientV2(
-                url=f"{proto}://{self.config.hostname}:{self.config.port}",
-                port=self.config.port,
-                token=self.config.token,
-                org=self.config.organisation,
-                ssl=self.config.tls_enabled,
-                verify_ssl=self.config.verify_tls,
-                timeout=self.connection_timeout_v2 * 1000,
-                debug=debug
-            )
+        self.session = InfluxDBClient(
+            url=f"{proto}://{self.config.hostname}:{self.config.port}",
+            port=self.config.port,
+            token=self.config.token,
+            org=self.config.organisation,
+            ssl=self.config.tls_enabled,
+            verify_ssl=self.config.verify_tls,
+            timeout=self.connection_timeout * 1000,
+            debug=debug
+        )
 
         if user_agent is not None:
-            if self.session_v1 is not None:
-                self.session_v1_requests_session.headers.update({"User-Agent": user_agent})
-
-            if self.session_v2 is not None:
-                self.session_v2.api_client.user_agent = user_agent
+            self.session.api_client.user_agent = user_agent
 
     def connect(self):
 
         if self.init_successful is True:
             return
 
-        if self.config.version == 1:
+        try:
+            self.version = str(self.session.version().split(",")[0])
 
-            try:
-                self.version = str(self.session_v1.ping())
+        except Exception as e:
+            log.error(f"Failed to connect to InfluxDB: {e}")
+            return
 
-            except Exception as e:
-                log.error(f"Failed to connect to InfluxDB: {e}")
-                return
+        # check status on influxdb buckets, if possible
+        self.check_bucket_status()
 
-            # check influx db status
-            self.check_db_status()
-
-        else:
-
-            try:
-                self.version = str(self.session_v2.version().split(",")[0])
-
-            except Exception as e:
-                log.error(f"Failed to connect to InfluxDB: {e}")
-                return
-
-            # check status on influxdb buckets, if possible
-            self.check_bucket_status()
-
-            self.session_v2_write_api = self.session_v2.write_api(write_options=SYNCHRONOUS)
+        self.write_api = self.session.write_api(write_options=SYNCHRONOUS)
 
     def close(self):
 
-        if self.session_v1 is not None:
-            self.session_v1.close()
+        if self.session is not None:
+            self.session.close()
             log.info("Closed InfluxDB session")
-
-        if self.session_v2 is not None:
-            self.session_v2.close()
-            log.info("Closed InfluxDB session")
-
-    def check_db_status(self):
-        """
-        Check if InfluxDB handler has access to a database.
-        If it doesn't exist try to create it.
-        """
-
-        if self.config.version != 1:
-            return
-
-        if self.session_v1 is None:
-            log.error("Unable to check InfluxDB status. Session not initiated")
-            return
-
-        if self.config.database is None:
-            log.error("InfluxDB database undefined in config")
-
-        try:
-            db_list = self.session_v1.get_list_database()
-        except Exception as e:
-            log.error(f"Problem connecting to InfluxDB database: {e}")
-            return
-
-        if self.config.database not in [db['name'] for db in db_list]:
-
-            log.info(f"Database '{self.config.database}' not found, trying to create it")
-
-            try:
-                self.session_v1.create_database(self.config.database)
-            except Exception as e:
-                log.error(f"Problem creating database: {e}")
-                return
-        else:
-            log.debug(f"InfluxDB database '{self.config.database}' exists")
-
-        retention_policies = list()
-        retention_policies_query_successful = False
-        try:
-            retention_policies = self.session_v1.get_list_retention_policies(self.config.database)
-            retention_policies_query_successful = True
-        except Exception as e:
-            log.warning(f"Problem querying database retention policies: {e}")
-
-        if retention_policies_query_successful and len(retention_policies) == 0:
-            try:
-                self.session_v1.create_retention_policy(
-                    name=f"fritzinfluxdb-{self.config.data_retention_days}-days",
-                    duration=f"{self.config.data_retention_days}d", replication="1",
-                    database=self.config.database, shard_duration="24h", default=True
-                )
-            except Exception as e:
-                log.warning(f"Problem creating database retention policy: {e}")
-
-        log.info(f"Connection to InfluxDB {self.version} established and database present")
-
-        self.init_successful = True
 
     def check_bucket_status(self):
 
-        if self.config.version != 2:
-            return
-
         # get list of buckets and see if the configured bucket exists
         try:
-            buckets_api = self.session_v2.buckets_api()
+            buckets_api = self.session.buckets_api()
             buckets = buckets_api.find_buckets().buckets
-            dbrp_api = DBRPsService(api_client=self.session_v2.api_client)
+            dbrp_api = DBRPsService(api_client=self.session.api_client)
         except ApiException as e:
             log.error(f"Problem reading configured InfluxDB buckets: {e.status}: {e.reason}")
             return
@@ -244,6 +141,8 @@ class InfluxHandler:
         if buckets is None or len(buckets) == 0:
             log.debug("Unable to read existing buckets. Assuming this is a token with "
                       "insufficient permissions to perform this action. Assuming the configured bucket is present.")
+            log.info("Unable to determine the retention period of the InfluxDB bucket. "
+                     "Measurements older than the retention period will be dropped by InfluxDB.")
 
             self.init_successful = True
             log.info("Connection to InfluxDB 2 established")
@@ -273,6 +172,8 @@ class InfluxHandler:
                 return
 
             log.info(f"Successfully create InfluxDB bucket '{self.config.bucket}'")
+
+        self.set_retention_period(bucket_data)
 
         # create new bucket
         if bucket_data is not None:
@@ -312,6 +213,58 @@ class InfluxHandler:
 
         self.init_successful = True
 
+    def set_retention_period(self, bucket_data):
+        """
+        read the retention period from the bucket's "expire" retention rule.
+        A rule with 0 seconds means data never expires.
+        """
+
+        self.retention_period = None
+
+        for rule in getattr(bucket_data, "retention_rules", None) or list():
+            if rule.type == "expire" and isinstance(rule.every_seconds, int) and rule.every_seconds > 0:
+                self.retention_period = timedelta(seconds=rule.every_seconds)
+
+        if self.retention_period is None:
+            log.info(f"InfluxDB bucket '{self.config.bucket}' has no retention period")
+        else:
+            log.info(f"InfluxDB bucket '{self.config.bucket}' has a retention period of "
+                     f"{self.retention_period_days:g} days, "
+                     f"older measurements will be dropped before writing")
+
+    @property
+    def retention_period_days(self):
+        return self.retention_period.total_seconds() / 86400
+
+    def drop_measurements_outside_retention_period(self):
+        """
+        remove all measurements from the buffer which InfluxDB would refuse to write
+        as they are older than the retention period of the bucket
+        """
+
+        if self.retention_period is None or len(self.buffer) == 0:
+            return
+
+        oldest_permitted_timestamp = datetime.now(pytz.utc) - self.retention_period + self.retention_period_margin
+
+        def is_outside(measurement):
+            timestamp = measurement.timestamp
+            if timestamp.tzinfo is None or timestamp.tzinfo.utcoffset(timestamp) is None:
+                timestamp = pytz.utc.localize(timestamp)
+            return timestamp < oldest_permitted_timestamp
+
+        dropped = [x for x in self.buffer if is_outside(x)]
+
+        if len(dropped) == 0:
+            return
+
+        log.info(f"Dropping '{len(dropped)}' measurements which are older than the InfluxDB bucket "
+                 f"retention period of {self.retention_period_days:g} days")
+        for measurement in dropped:
+            log.debug(f"Dropped measurement: {measurement}")
+
+        self.buffer[:] = [x for x in self.buffer if not is_outside(x)]
+
     def convert_measurement(self, measurement):
 
         if not isinstance(measurement, FritzMeasurement):
@@ -346,19 +299,15 @@ class InfluxHandler:
         if self.permitted_to_write_data() is False:
             return
 
+        self.drop_measurements_outside_retention_period()
+
         if len(self.buffer) == 0:
             log.debug("InfluxDB data queue: No measurements found in queue")
             return
 
-        if self.out_of_retention_period_range is True:
-
-            # sort measurements to write out all the newest measurements first
-            # which probably won't hit the retention period boundary
-            self.buffer = sorted(self.buffer, key=lambda m: m.timestamp, reverse=True)
-
         # only use max amount of measurements to send to InfluxDB
-        log.debug(f"Trying to write a maximum of '{self.current_measurements_per_write}' measurements to InfluxDB")
-        local_buffer = self.buffer[0:self.current_measurements_per_write]
+        log.debug(f"Trying to write a maximum of '{self.max_measurements_per_write}' measurements to InfluxDB")
+        local_buffer = self.buffer[0:self.max_measurements_per_write]
 
         # convert FritzMeasurement to list of dicts
         data = [self.convert_measurement(x) for x in local_buffer]
@@ -366,56 +315,26 @@ class InfluxHandler:
         write_successful = False
         self.last_write_retry = datetime.now(pytz.utc)
         try:
-            if self.config.version == 1:
-                write_successful = self.session_v1.write_points(data, time_precision="u")
-            elif self.config.version == 2:
-                self.session_v2_write_api.write(bucket=self.config.bucket, record=data,
-                                                write_precision=WritePrecision.US)
-                write_successful = True
-        except (ApiException, InfluxDBClientError) as e:
+            self.write_api.write(bucket=self.config.bucket, record=data, write_precision=WritePrecision.US)
+            write_successful = True
+        except ApiException as e:
 
-            exception_message = None
-            http_code = 0
-            if isinstance(e, ApiException):
-                http_code = e.status
-                exception_message = e.message
-            if isinstance(e, InfluxDBClientError):
-                http_code = e.code
-                exception_message = e.content
-
+            exception_message = e.message
             if exception_message is None:
                 exception_message = str(e)
 
-            if "points beyond retention policy" in f"{exception_message}":
-
-                log.debug("InfluxDB refused to write data as there seems to be measurements "
-                          "which are older then the defined retention period")
-
-                self.out_of_retention_period_range = True
-                self.current_retry_interval = 0
-
-                # get timestamp of measurement which is just out of range
-                if self.current_measurements_per_write <= 1 and len(self.buffer) > 0:
-                    newest_measurement = self.buffer[0]
-                    num_purged = len([x for x in self.buffer if x.timestamp <= newest_measurement.timestamp])
-                    log.info(f"Purging '{num_purged}' measurements which are older ({newest_measurement.timestamp}) "
-                             f"then the InfluxDB configured retention period")
-                    for entry in self.buffer:
-                        if entry.timestamp <= newest_measurement.timestamp:
-                            log.debug(f"Dropped measurement: {entry}")
-                    self.buffer[:] = [x for x in self.buffer if x.timestamp > newest_measurement.timestamp]
-                else:
-                    self.set_num_current_measurements_to_write(int(self.current_measurements_per_write/2))
+            # InfluxDB wrote all measurements but the ones older than the retention period.
+            # Retrying would only fail again, so the write is treated as successful.
+            if e.status == 422 and "partial write" in exception_message and "retention policy" in exception_message:
+                log.info(f"InfluxDB dropped measurements which are older than the bucket retention period: "
+                         f"{exception_message}")
+                write_successful = True
             else:
-                log.error(f"Failed to write to InfluxDB '{self.config.hostname}': {http_code}: {exception_message}")
+                log.error(f"Failed to write to InfluxDB '{self.config.hostname}': {e.status}: {exception_message}")
 
         except Exception as e:
             self.connection_lost = True
             log.error(f"Failed to write to InfluxDB '{self.config.hostname}': {e}")
-
-        if len(self.buffer) == 0:
-            self.out_of_retention_period_range = False
-            self.current_measurements_per_write = self.max_measurements_per_write
 
         if write_successful is True:
             if self.connection_lost is True:
@@ -429,24 +348,9 @@ class InfluxHandler:
             self.last_write_retry = None
             self.current_retry_interval = self.retry_interval
 
-            self.out_of_retention_period_range = False
-            self.set_num_current_measurements_to_write(self.current_measurements_per_write * 4)
-
         else:
             if self.connection_lost is True:
                 self.current_retry_interval *= 2
-
-    def set_num_current_measurements_to_write(self, num_measurements: int):
-
-        if not isinstance(num_measurements, int):
-            return
-
-        if num_measurements < 1:
-            self.current_measurements_per_write = 1
-        elif num_measurements >= self.max_measurements_per_write:
-            self.current_measurements_per_write = self.max_measurements_per_write
-        else:
-            self.current_measurements_per_write = num_measurements
 
     async def check_buffer(self):
 
@@ -485,8 +389,7 @@ class InfluxHandler:
             await self.check_buffer()
 
             log.debug(f"Current InfluxDB measurement buffer length: {len(self.buffer)}")
-            if self.out_of_retention_period_range is False:
-                await asyncio.sleep(1)
+            await asyncio.sleep(1)
 
 
 class InfluxLogAndConfigWriter:
