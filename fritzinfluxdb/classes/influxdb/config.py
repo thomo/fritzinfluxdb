@@ -20,9 +20,10 @@ class InfluxDBConfig(ConfigBase):
         class which defines the InfluxDB config options
     """
 
+    # only InfluxDB 2 is supported, option is kept to reject configs written for InfluxDB 1
     version = {
         "type": int,
-        "default": 1
+        "default": 2
     }
     hostname = {
         "type": str,
@@ -52,21 +53,6 @@ class InfluxDBConfig(ConfigBase):
         "default": 365
     }
 
-    # version 1 parameters
-    username = {
-        "type": str,
-        "default": None
-    }
-    password = {
-        "type": str,
-        "default": None
-    }
-    database = {
-        "type": str,
-        "default": None
-    }
-
-    # version 2 parameters
     token = {
         "type": str,
         "default": None
@@ -87,18 +73,9 @@ class InfluxDBConfig(ConfigBase):
         super().parse_config(config_data)
 
         # validate data
-        mandatory_keys = list()
-        if self.version == 1:
-            mandatory_keys = ["hostname", "database"]
-
-            if [getattr(self, "username"), getattr(self, "password")].count(None) == 1:
-                log.error(f"Username and password must be defined together or not at all for InfluxDB '{self.version}'")
-                self.parser_error = True
-
-        elif self.version == 2:
-            mandatory_keys = ["hostname", "token", "organisation", "bucket"]
-        else:
-            log.error(f"Invalid InfluxDB version '{self.version}'.")
+        mandatory_keys = ["hostname", "token", "organisation", "bucket"]
+        if self.version != 2:
+            log.error(f"Invalid InfluxDB version '{self.version}'. Only InfluxDB 2 is supported.")
             self.parser_error = True
 
         for key in mandatory_keys:
